@@ -56,13 +56,17 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
 
       - name: Code Quality (Lint)
-        run: pnpm lint
-        continue-on-error: true
+        run: |
+          if ! pnpm lint; then
+            echo "::warning::Frontend lint reported issues, but QA pipeline will continue."
+          fi
         working-directory: ${{ inputs.working-directory }}
 
       - name: Security Audit (Dependencies)
-        run: pnpm audit --audit-level=high
-        continue-on-error: true
+        run: |
+          if ! pnpm audit --audit-level=high; then
+            echo "::warning::Frontend dependency audit reported issues, but QA pipeline will continue."
+          fi
         working-directory: ${{ inputs.working-directory }}
 
       - name: Build Vite App
