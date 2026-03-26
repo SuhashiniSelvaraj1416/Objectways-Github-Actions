@@ -3,9 +3,10 @@ name: Python CI/CD
 on:
   workflow_call:
     inputs:
-      python-version: { type: string, default: '3.12' }
+      python-version: { type: string, default: '3.11' }
       working-directory: { type: string, default: 'backend' }
       aws-region: { type: string, required: true }
+      build-runner: { type: string, default: 'ubuntu-latest' }
       deploy-runner: { type: string, default: 'self-hosted' }
       s3-bucket: { type: string, required: true }
       deploy-path: { type: string, required: true } # BASE directory
@@ -22,24 +23,39 @@ permissions:
 
 jobs:
   build-test:
-    runs-on: ${{ inputs.deploy-runner }}
+    runs-on: ${{ inputs.build-runner }}
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
-      - name: Set up Python
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Set up Python Environment
         run: |
-          python3 -m venv .venv
+          python -m venv .venv
           source .venv/bin/activate
           pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-pinned.txt ]; then
+            pip install -r requirements-pinned.txt
+          elif [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
           pip install safety ruff pytest
         working-directory: ${{ inputs.working-directory }}
 
       - name: Dependency Audit (Safety)
         run: |
           source .venv/bin/activate
-          safety check -r requirements.txt
+          if [ -f requirements-pinned.txt ]; then
+            safety check -r requirements-pinned.txt
+          elif [ -f requirements.txt ]; then
+            safety check -r requirements.txt
+          else
+            echo "No requirements file found, skipping safety check"
+          fi
         continue-on-error: true
         working-directory: ${{ inputs.working-directory }}
 
@@ -52,10 +68,9 @@ jobs:
 
       - name: Prepare Artifact
         run: |
-          mkdir -p deploy-package
-          rsync -a ./ deploy-package/ --exclude .git --exclude .venv --exclude __pycache__
-          cd deploy-package
-          tar -czf ../release-${{ github.sha }}.tar.gz .
+          mkdir -p artifact/backend
+          rsync -a ./ artifact/backend/ --exclude .git --exclude .venv --exclude __pycache__
+          tar -czf release-${{ github.sha }}.tar.gz -C artifact .
         working-directory: ${{ inputs.working-directory }}
 
       - name: AWS Auth
@@ -97,7 +112,7 @@ jobs:
           echo "Deploying Backend Release: $RELEASE_ID"
           mkdir -p "$RELEASES_DIR"
 
-          # 1. SMART MIGRATION SAFEGUARD
+          # First-run migration safeguard
           if [ -d "$CURRENT_LINK" ] && [ ! -L "$CURRENT_LINK" ]; then
             echo "MIGRATION: Existing directory found at $CURRENT_LINK. Moving to releases/legacy_backup."
             mv "$CURRENT_LINK" "$RELEASES_DIR/legacy_backup_$(date +%Y%m%d%H%M%S)"
@@ -105,36 +120,44 @@ jobs:
           
           mkdir -p "$NEW_RELEASE_DIR"
           
-          # 2. Fetch & Extract
+          # Fetch and extract artifact
           aws s3 cp s3://${{ inputs.s3-bucket }}/backend/releases/release-${{ github.sha }}.tar.gz artifact.tar.gz
           tar -xzf artifact.tar.gz -C "$NEW_RELEASE_DIR"
           rm artifact.tar.gz
 
-          # 3. Setup production venv in the new release
-          cd "$NEW_RELEASE_DIR"
-          python3 -m venv .venv
-          source .venv/bin/activate
+          # Setup production venv inside backend/
+          cd "$NEW_RELEASE_DIR/backend"
+          python3 -m venv venv
+          source venv/bin/activate
           pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-pinned.txt ]; then
+            pip install -r requirements-pinned.txt
+          elif [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
 
-          # 4. Restore .env if provided
+          # Restore env file into backend/
           if [ -f "$ENV_SOURCE" ]; then
-            cp "$ENV_SOURCE" "$NEW_RELEASE_DIR/.env"
+            cp "$ENV_SOURCE" "$NEW_RELEASE_DIR/backend/.env"
             echo "Env restored from $ENV_SOURCE"
           fi
 
-          # 5. ATOMIC SWITCH
+          # Atomic switch
           ln -sfn "$NEW_RELEASE_DIR" "$CURRENT_LINK"
 
-          # 4. Restart Service
+          # Restart service
           echo "Restarting service: $SERVICE_NAME"
           if systemctl list-units --full -all | grep -Fq "$SERVICE_NAME"; then
-             sudo systemctl restart "$SERVICE_NAME"
+            sudo systemctl restart "$SERVICE_NAME"
           else
-             echo "Warning: Service $SERVICE_NAME not found. Setup manual systemd pointer to '$BASE_DIR/current'."
+            echo "Warning: Service $SERVICE_NAME not found."
           fi
 
-          # 5. Release Retention
-          cd "$RELEASES_DIR" && ls -t | tail -n +6 | xargs rm -rf -- || true
+          # Keep latest 5 real releases only
+          find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d ! -name 'legacy_backup*' -printf '%T@ %p\n' \
+            | sort -nr \
+            | tail -n +6 \
+            | cut -d' ' -f2- \
+            | xargs -r rm -rf
           
-          echo "Backend Deployment Successful."
+          echo "Backend Deployment Successful. Current points to: $(readlink -f "$CURRENT_LINK")"

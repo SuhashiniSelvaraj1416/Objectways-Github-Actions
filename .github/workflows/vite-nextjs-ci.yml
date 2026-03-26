@@ -7,6 +7,7 @@ on:
       pnpm-version: { type: string, default: '10' }
       working-directory: { type: string, default: 'frontend' }
       aws-region: { type: string, required: true }
+      build-runner: { type: string, default: 'ubuntu-latest' }
       deploy-runner: { type: string, default: 'self-hosted' }
       s3-bucket: { type: string, required: true }
       deploy-path: { type: string, required: true } # BASE directory
@@ -21,7 +22,7 @@ permissions:
 
 jobs:
   build-test:
-    runs-on: ${{ inputs.deploy-runner }}
+    runs-on: ${{ inputs.build-runner }}
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 
@@ -70,8 +71,9 @@ jobs:
 
       - name: Prepare Artifact
         run: |
-          cd dist
-          tar -czf ../release-${{ github.sha }}.tar.gz .
+          mkdir -p artifact/frontend/dist
+          cp -r dist/. artifact/frontend/dist/
+          tar -czf release-${{ github.sha }}.tar.gz -C artifact .
         working-directory: ${{ inputs.working-directory }}
 
       - name: AWS Auth (OIDC)
@@ -111,26 +113,28 @@ jobs:
           echo "Starting Atomic Deployment for Release: $RELEASE_ID"
           mkdir -p "$RELEASES_DIR"
 
-          # 1. SMART MIGRATION SAFEGUARD (First-run protection)
-          # If 'current' is a directory (not a symlink), move it to releases to avoid ln failure
+          # First-run migration safeguard
           if [ -d "$CURRENT_LINK" ] && [ ! -L "$CURRENT_LINK" ]; then
             echo "MIGRATION: Existing directory found at $CURRENT_LINK. Moving to releases/legacy_backup."
             mv "$CURRENT_LINK" "$RELEASES_DIR/legacy_backup_$(date +%Y%m%d%H%M%S)"
           fi
           
-          # 2. Prepare Workspace
+          # Prepare release directory
           mkdir -p "$NEW_RELEASE_DIR"
           
-          # 3. Fetch Artifact
+          # Fetch and extract artifact
           aws s3 cp s3://${{ inputs.s3-bucket }}/frontend/releases/release-${{ github.sha }}.tar.gz artifact.tar.gz
           tar -xzf artifact.tar.gz -C "$NEW_RELEASE_DIR"
           rm artifact.tar.gz
 
-          # 4. ATOMIC SWITCH
+          # Atomic switch
           ln -sfn "$NEW_RELEASE_DIR" "$CURRENT_LINK"
+
+          # Release retention: keep latest 5 real releases only
+          find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d ! -name 'legacy_backup*' -printf '%T@ %p\n' \
+            | sort -nr \
+            | tail -n +6 \
+            | cut -d' ' -f2- \
+            | xargs -r rm -rf
           
-          # 5. Release Retention (Keep last 5)
-          echo "Cleaning up old releases..."
-          cd "$RELEASES_DIR" && ls -t | grep -v "legacy_backup" | tail -n +6 | xargs rm -rf -- || true
-          
-          echo "Deployment Successful. Current points to: $(readlink -f $CURRENT_LINK)"
+          echo "Deployment Successful. Current points to: $(readlink -f "$CURRENT_LINK")"
