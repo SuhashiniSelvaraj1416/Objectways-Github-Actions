@@ -50,20 +50,30 @@ jobs:
         run: |
           source .venv/bin/activate
           if [ -f requirements-pinned.txt ]; then
-            safety check -r requirements-pinned.txt
+            if ! safety check -r requirements-pinned.txt; then
+              echo "::warning::Backend dependency audit reported issues, but QA pipeline will continue."
+            fi
           elif [ -f requirements.txt ]; then
-            safety check -r requirements.txt
+            if ! safety check -r requirements.txt; then
+              echo "::warning::Backend dependency audit reported issues, but QA pipeline will continue."
+            fi
           else
             echo "No requirements file found, skipping safety check"
           fi
-        continue-on-error: true
         working-directory: ${{ inputs.working-directory }}
 
       - name: Code Quality (Ruff)
         run: |
           source .venv/bin/activate
-          ruff check .
-        continue-on-error: true
+          if ! ruff check .; then
+            echo "::warning::Backend ruff checks reported issues, but QA pipeline will continue."
+          fi
+        working-directory: ${{ inputs.working-directory }}
+
+      - name: Import Verification
+        run: |
+          source .venv/bin/activate
+          python -c "from app.main import app; print('backend import OK')"
         working-directory: ${{ inputs.working-directory }}
 
       - name: Prepare Artifact
