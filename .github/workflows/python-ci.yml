@@ -40,25 +40,19 @@ jobs:
           pip install --upgrade pip
           if [ -f requirements-pinned.txt ]; then
             pip install -r requirements-pinned.txt
-          elif [ -f requirements.txt ]; then
-            pip install -r requirements.txt
+          else
+            echo "requirements-pinned.txt is required by the CI/CD architecture plan"
+            exit 1
           fi
+
           pip install safety ruff pytest
         working-directory: ${{ inputs.working-directory }}
 
       - name: Dependency Audit (Safety)
         run: |
           source .venv/bin/activate
-          if [ -f requirements-pinned.txt ]; then
-            if ! safety check -r requirements-pinned.txt; then
-              echo "::warning::Backend dependency audit reported issues, but QA pipeline will continue."
-            fi
-          elif [ -f requirements.txt ]; then
-            if ! safety check -r requirements.txt; then
-              echo "::warning::Backend dependency audit reported issues, but QA pipeline will continue."
-            fi
-          else
-            echo "No requirements file found, skipping safety check"
+          if ! safety check -r requirements-pinned.txt; then
+            echo "::warning::Backend dependency audit reported issues, but QA pipeline will continue."
           fi
         working-directory: ${{ inputs.working-directory }}
 
@@ -80,8 +74,14 @@ jobs:
 
       - name: Prepare Artifact
         run: |
+          rm -rf artifact
           mkdir -p artifact/backend
-          rsync -a ./ artifact/backend/ --exclude .git --exclude .venv --exclude __pycache__
+          rsync -a ./ artifact/backend/ \
+            --exclude .git \
+            --exclude .venv \
+            --exclude __pycache__ \
+            --exclude .ruff_cache \
+            --exclude artifact
           tar -czf release-${{ github.sha }}.tar.gz -C artifact .
         working-directory: ${{ inputs.working-directory }}
 
@@ -97,148 +97,3 @@ jobs:
         run: |
           aws s3 cp release-${{ github.sha }}.tar.gz s3://${{ inputs.s3-bucket }}/backend/releases/release-${{ github.sha }}.tar.gz
         working-directory: ${{ inputs.working-directory }}
-
-  deploy:
-    needs: build-test
-    runs-on: ${{ inputs.deploy-runner }}
-    steps:
-      - name: AWS Auth
-        if: ${{ !env.ACT }}
-        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
-        with:
-          role-to-assume: ${{ secrets.aws-role-arn }}
-          aws-region: ${{ inputs.aws-region }}
-
-      - name: Atomic Deployment
-        if: ${{ !env.ACT }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          BASE_DIR=$(echo "${{ inputs.deploy-path }}" | xargs)
-          RELEASE_ID=$(date +%Y%m%d%H%M%S)-${{ github.sha }}
-          RELEASES_DIR="$BASE_DIR/releases"
-          NEW_RELEASE_DIR="$RELEASES_DIR/$RELEASE_ID"
-          SERVICE_NAME="${{ inputs.serviceName }}"
-          ENV_SOURCE=$(echo "${{ inputs.env-source-path }}" | xargs)
-          CURRENT_LINK="$BASE_DIR/current"
-
-          echo "=========================================="
-          echo "Deploying Backend Release: $RELEASE_ID"
-          echo "=========================================="
-          mkdir -p "$RELEASES_DIR"
-
-          # ── First-run migration safeguard ──
-          if [ -d "$CURRENT_LINK" ] && [ ! -L "$CURRENT_LINK" ]; then
-            echo "MIGRATION: Existing directory found at $CURRENT_LINK. Moving to releases/legacy_backup."
-            mv "$CURRENT_LINK" "$RELEASES_DIR/legacy_backup_$(date +%Y%m%d%H%M%S)"
-          fi
-
-          mkdir -p "$NEW_RELEASE_DIR"
-
-          # ── Preserve existing frontend from previous release ──
-          if [ -d "$CURRENT_LINK/frontend" ]; then
-            cp -a "$CURRENT_LINK/frontend" "$NEW_RELEASE_DIR/"
-            echo "Preserved frontend from prior release"
-          fi
-
-          # ── Fetch and extract artifact from S3 ──
-          aws s3 cp s3://${{ inputs.s3-bucket }}/backend/releases/release-${{ github.sha }}.tar.gz artifact.tar.gz
-          tar -xzf artifact.tar.gz -C "$NEW_RELEASE_DIR"
-          rm artifact.tar.gz
-
-          # ── Setup production venv ──
-          cd "$NEW_RELEASE_DIR/backend"
-          python3 -m venv venv
-          source venv/bin/activate
-          pip install --upgrade pip
-
-          if [ -f requirements-pinned.txt ]; then
-            pip install -r requirements-pinned.txt
-          elif [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
-
-          # ── EC2 production overrides (Section 9 of Architecture Plan) ──
-          # Force-installs packages listed in requirements-force.txt that override
-          # broken versions in requirements-pinned.txt for our EC2 OS environment
-          if [ -f requirements-force.txt ]; then
-            pip install --force-reinstall -r requirements-force.txt
-            echo "EC2 overrides applied from requirements-force.txt"
-          fi
-
-          # ── Restore env file ──
-          if [ -f "$ENV_SOURCE" ]; then
-            cp "$ENV_SOURCE" "$NEW_RELEASE_DIR/backend/.env"
-            echo "Env restored from $ENV_SOURCE"
-          fi
-
-          # ── Import verification on EC2 (Section 17 of Architecture Plan) ──
-          # Must run HERE (not in build-test) to verify against actual EC2 OS libs
-          python -c "import cv2; print('opencv OK')"
-          python -c "from fastapi_limiter import FastAPILimiter; print('limiter OK')"
-          python -c "import bcrypt; print('bcrypt OK')"
-          python -c "from app.main import app; print('app import OK')"
-
-          # ── Database schema verification (Section 10 & 14 of Architecture Plan) ──
-          # Ensure RDS is reachable and critical tables exist before switching
-          if [ -f "$NEW_RELEASE_DIR/backend/.env" ]; then
-            source "$NEW_RELEASE_DIR/backend/.env"
-            export PGPASSWORD="$PG_PASSWORD"
-
-            psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" <<'SQL'
-          CREATE TABLE IF NOT EXISTS clients (
-            id           SERIAL PRIMARY KEY,
-            slug         VARCHAR(100) UNIQUE NOT NULL,
-            display_name VARCHAR(200),
-            created_at   TIMESTAMP DEFAULT NOW()
-          );
-
-          CREATE TABLE IF NOT EXISTS users (
-            id         SERIAL PRIMARY KEY,
-            email      VARCHAR(255) UNIQUE NOT NULL,
-            hashed_pw  TEXT NOT NULL,
-            role       VARCHAR(50) DEFAULT 'annotator',
-            client_id  INTEGER REFERENCES clients(id),
-            created_at TIMESTAMP DEFAULT NOW()
-          );
-
-          INSERT INTO clients (slug, display_name)
-          VALUES ('__global__', 'Global')
-          ON CONFLICT DO NOTHING;
-          SQL
-
-            unset PGPASSWORD
-            echo "Database schema verification passed"
-          else
-            echo "Warning: .env not found — skipping database schema check"
-          fi
-
-          # ── Atomic symlink switch ──
-          ln -sfn "$NEW_RELEASE_DIR" "$CURRENT_LINK"
-
-          # ── Restart service ──
-          echo "Restarting service: $SERVICE_NAME"
-          if systemctl list-units --full -all | grep -Fq "$SERVICE_NAME"; then
-            sudo systemctl restart "$SERVICE_NAME"
-          else
-            echo "Warning: Service $SERVICE_NAME not found."
-          fi
-
-          # ── Post-deploy health check (Section 17 of Architecture Plan) ──
-          echo "Waiting for backend to start..."
-          sleep 5
-          curl --fail --max-time 30 http://localhost/api/system/health || exit 1
-          echo "Health check passed"
-
-          # ── Cleanup: keep latest 5 real releases only ──
-          find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d ! -name 'legacy_backup*' -printf '%T@ %p\n' \
-            | sort -nr \
-            | tail -n +6 \
-            | cut -d' ' -f2- \
-            | xargs -r rm -rf
-
-          echo "=========================================="
-          echo "Backend Deployment Successful"
-          echo "Current points to: $(readlink -f "$CURRENT_LINK")"
-          echo "=========================================="
