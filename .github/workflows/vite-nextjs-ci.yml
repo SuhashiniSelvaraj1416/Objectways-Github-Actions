@@ -108,37 +108,59 @@ jobs:
         if: ${{ !env.ACT }}
         shell: bash
         run: |
+          set -euo pipefail
+
           BASE_DIR=$(echo "${{ inputs.deploy-path }}" | xargs)
           RELEASE_ID=$(date +%Y%m%d%H%M%S)-${{ github.sha }}
           RELEASES_DIR="$BASE_DIR/releases"
           NEW_RELEASE_DIR="$RELEASES_DIR/$RELEASE_ID"
           CURRENT_LINK="$BASE_DIR/current"
-          
-          echo "Starting Atomic Deployment for Release: $RELEASE_ID"
+
+          echo "=========================================="
+          echo "Deploying Frontend Release: $RELEASE_ID"
+          echo "=========================================="
           mkdir -p "$RELEASES_DIR"
 
-          # First-run migration safeguard
+          # ── First-run migration safeguard ──
           if [ -d "$CURRENT_LINK" ] && [ ! -L "$CURRENT_LINK" ]; then
             echo "MIGRATION: Existing directory found at $CURRENT_LINK. Moving to releases/legacy_backup."
             mv "$CURRENT_LINK" "$RELEASES_DIR/legacy_backup_$(date +%Y%m%d%H%M%S)"
           fi
-          
-          # Prepare release directory
+
           mkdir -p "$NEW_RELEASE_DIR"
-          
-          # Fetch and extract artifact
+
+          # ── Preserve existing backend from previous release ──
+          if [ -d "$CURRENT_LINK/backend" ]; then
+            cp -a "$CURRENT_LINK/backend" "$NEW_RELEASE_DIR/"
+            echo "Preserved backend from prior release"
+          fi
+
+          # ── Fetch and extract artifact from S3 ──
           aws s3 cp s3://${{ inputs.s3-bucket }}/frontend/releases/release-${{ github.sha }}.tar.gz artifact.tar.gz
           tar -xzf artifact.tar.gz -C "$NEW_RELEASE_DIR"
           rm artifact.tar.gz
 
-          # Atomic switch
+          # ── Atomic symlink switch ──
           ln -sfn "$NEW_RELEASE_DIR" "$CURRENT_LINK"
 
-          # Release retention: keep latest 5 real releases only
+          # ── Reload Nginx (Section 8 of Architecture Plan) ──
+          # Nginx caches resolved symlink paths internally; reload forces it
+          # to re-resolve the 'current' symlink to the new release directory
+          sudo systemctl reload nginx
+          echo "Nginx reloaded"
+
+          # ── Post-deploy health check (Section 17 of Architecture Plan) ──
+          curl --fail --max-time 10 http://localhost/ || exit 1
+          echo "Frontend health check passed"
+
+          # ── Cleanup: keep latest 5 real releases only ──
           find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d ! -name 'legacy_backup*' -printf '%T@ %p\n' \
             | sort -nr \
             | tail -n +6 \
             | cut -d' ' -f2- \
             | xargs -r rm -rf
-          
-          echo "Deployment Successful. Current points to: $(readlink -f "$CURRENT_LINK")"
+
+          echo "=========================================="
+          echo "Frontend Deployment Successful"
+          echo "Current points to: $(readlink -f "$CURRENT_LINK")"
+          echo "=========================================="

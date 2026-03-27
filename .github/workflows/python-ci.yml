@@ -113,6 +113,8 @@ jobs:
         if: ${{ !env.ACT }}
         shell: bash
         run: |
+          set -euo pipefail
+
           BASE_DIR=$(echo "${{ inputs.deploy-path }}" | xargs)
           RELEASE_ID=$(date +%Y%m%d%H%M%S)-${{ github.sha }}
           RELEASES_DIR="$BASE_DIR/releases"
@@ -121,43 +123,101 @@ jobs:
           ENV_SOURCE=$(echo "${{ inputs.env-source-path }}" | xargs)
           CURRENT_LINK="$BASE_DIR/current"
 
+          echo "=========================================="
           echo "Deploying Backend Release: $RELEASE_ID"
+          echo "=========================================="
           mkdir -p "$RELEASES_DIR"
 
-          # First-run migration safeguard
+          # ── First-run migration safeguard ──
           if [ -d "$CURRENT_LINK" ] && [ ! -L "$CURRENT_LINK" ]; then
             echo "MIGRATION: Existing directory found at $CURRENT_LINK. Moving to releases/legacy_backup."
             mv "$CURRENT_LINK" "$RELEASES_DIR/legacy_backup_$(date +%Y%m%d%H%M%S)"
           fi
-          
+
           mkdir -p "$NEW_RELEASE_DIR"
-          
-          # Fetch and extract artifact
+
+          # ── Preserve existing frontend from previous release ──
+          if [ -d "$CURRENT_LINK/frontend" ]; then
+            cp -a "$CURRENT_LINK/frontend" "$NEW_RELEASE_DIR/"
+            echo "Preserved frontend from prior release"
+          fi
+
+          # ── Fetch and extract artifact from S3 ──
           aws s3 cp s3://${{ inputs.s3-bucket }}/backend/releases/release-${{ github.sha }}.tar.gz artifact.tar.gz
           tar -xzf artifact.tar.gz -C "$NEW_RELEASE_DIR"
           rm artifact.tar.gz
 
-          # Setup production venv inside backend/
+          # ── Setup production venv ──
           cd "$NEW_RELEASE_DIR/backend"
           python3 -m venv venv
           source venv/bin/activate
           pip install --upgrade pip
+
           if [ -f requirements-pinned.txt ]; then
             pip install -r requirements-pinned.txt
           elif [ -f requirements.txt ]; then
             pip install -r requirements.txt
           fi
 
-          # Restore env file into backend/
+          # ── EC2 production overrides (Section 9 of Architecture Plan) ──
+          # Force-installs packages listed in requirements-force.txt that override
+          # broken versions in requirements-pinned.txt for our EC2 OS environment
+          if [ -f requirements-force.txt ]; then
+            pip install --force-reinstall -r requirements-force.txt
+            echo "EC2 overrides applied from requirements-force.txt"
+          fi
+
+          # ── Restore env file ──
           if [ -f "$ENV_SOURCE" ]; then
             cp "$ENV_SOURCE" "$NEW_RELEASE_DIR/backend/.env"
             echo "Env restored from $ENV_SOURCE"
           fi
 
-          # Atomic switch
+          # ── Import verification on EC2 (Section 17 of Architecture Plan) ──
+          # Must run HERE (not in build-test) to verify against actual EC2 OS libs
+          python -c "import cv2; print('opencv OK')"
+          python -c "from fastapi_limiter import FastAPILimiter; print('limiter OK')"
+          python -c "import bcrypt; print('bcrypt OK')"
+          python -c "from app.main import app; print('app import OK')"
+
+          # ── Database schema verification (Section 10 & 14 of Architecture Plan) ──
+          # Ensure RDS is reachable and critical tables exist before switching
+          if [ -f "$NEW_RELEASE_DIR/backend/.env" ]; then
+            source "$NEW_RELEASE_DIR/backend/.env"
+            export PGPASSWORD="$PG_PASSWORD"
+
+            psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" <<'SQL'
+          CREATE TABLE IF NOT EXISTS clients (
+            id           SERIAL PRIMARY KEY,
+            slug         VARCHAR(100) UNIQUE NOT NULL,
+            display_name VARCHAR(200),
+            created_at   TIMESTAMP DEFAULT NOW()
+          );
+
+          CREATE TABLE IF NOT EXISTS users (
+            id         SERIAL PRIMARY KEY,
+            email      VARCHAR(255) UNIQUE NOT NULL,
+            hashed_pw  TEXT NOT NULL,
+            role       VARCHAR(50) DEFAULT 'annotator',
+            client_id  INTEGER REFERENCES clients(id),
+            created_at TIMESTAMP DEFAULT NOW()
+          );
+
+          INSERT INTO clients (slug, display_name)
+          VALUES ('__global__', 'Global')
+          ON CONFLICT DO NOTHING;
+          SQL
+
+            unset PGPASSWORD
+            echo "Database schema verification passed"
+          else
+            echo "Warning: .env not found — skipping database schema check"
+          fi
+
+          # ── Atomic symlink switch ──
           ln -sfn "$NEW_RELEASE_DIR" "$CURRENT_LINK"
 
-          # Restart service
+          # ── Restart service ──
           echo "Restarting service: $SERVICE_NAME"
           if systemctl list-units --full -all | grep -Fq "$SERVICE_NAME"; then
             sudo systemctl restart "$SERVICE_NAME"
@@ -165,11 +225,20 @@ jobs:
             echo "Warning: Service $SERVICE_NAME not found."
           fi
 
-          # Keep latest 5 real releases only
+          # ── Post-deploy health check (Section 17 of Architecture Plan) ──
+          echo "Waiting for backend to start..."
+          sleep 5
+          curl --fail --max-time 30 http://localhost/api/system/health || exit 1
+          echo "Health check passed"
+
+          # ── Cleanup: keep latest 5 real releases only ──
           find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d ! -name 'legacy_backup*' -printf '%T@ %p\n' \
             | sort -nr \
             | tail -n +6 \
             | cut -d' ' -f2- \
             | xargs -r rm -rf
-          
-          echo "Backend Deployment Successful. Current points to: $(readlink -f "$CURRENT_LINK")"
+
+          echo "=========================================="
+          echo "Backend Deployment Successful"
+          echo "Current points to: $(readlink -f "$CURRENT_LINK")"
+          echo "=========================================="
